@@ -17,7 +17,9 @@
 [CmdletBinding()]
 param(
     [int]$DebounceSeconds = 3,
-    [string]$Remote = "origin"
+    [string]$Remote = "origin",
+    [string]$Branch = "",
+    [switch]$Once
 )
 
 $ErrorActionPreference = "Continue"
@@ -31,17 +33,21 @@ $repoRoot = $repoRoot.Trim().Replace('/', '\')
 Set-Location $repoRoot
 
 function Get-GitBranch {
-    $branch = (git branch --show-current 2>$null)
-    if (-not $branch) {
-        $branch = (git rev-parse --abbrev-ref HEAD 2>$null)
+    if ($Branch) { return $Branch }
+    $currentBranch = (git branch --show-current 2>$null)
+    if (-not $currentBranch) {
+        $currentBranch = (git rev-parse --abbrev-ref HEAD 2>$null)
     }
-    return $branch.Trim()
+    if ($currentBranch) {
+        return $currentBranch.Trim()
+    }
+    return "main"
 }
 
 function Sync-GitChanges {
-    $branch = Get-GitBranch
-    if (-not $branch) {
-        Write-Warning "Cannot determine current git branch. Skipping sync."
+    $activeBranch = Get-GitBranch
+    if (-not $activeBranch) {
+        Write-Warning "Cannot determine git branch. Skipping sync."
         return
     }
 
@@ -52,26 +58,29 @@ function Sync-GitChanges {
     }
 
     $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $epoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $stashTag = "auto-sync-$epoch"
+
     Write-Host "`n[$timestamp] Changes detected! Starting sync..." -ForegroundColor Cyan
 
     # Step 1: Check remote and pull any incoming changes safely
-    Write-Host "-> Checking remote for incoming changes (git pull --rebase $Remote $branch)..." -ForegroundColor Yellow
+    Write-Host "-> Checking remote for incoming changes (git pull --rebase $Remote $activeBranch)..." -ForegroundColor Yellow
     
-    # Stash uncommitted changes temporarily to avoid rebase collisions with local modifications
     $needsPop = $false
-    git stash push -u -m "auto-sync-temp-stash" 2>&1 | Out-Null
+    git stash push -u -m "$stashTag" 2>&1 | Out-Null
     $stashList = git stash list
-    if ($stashList -match "auto-sync-temp-stash") {
+    if ($stashList -match $stashTag) {
         $needsPop = $true
     }
 
-    $pullOutput = git pull --rebase $Remote $branch 2>&1
+    $pullOutput = git pull --rebase $Remote $activeBranch 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "Pull failed or encountered conflicts: $pullOutput"
         if ($needsPop) {
+            Write-Host "-> Restoring local stashed changes..." -ForegroundColor Yellow
             git stash pop 2>&1 | Out-Null
         }
-        Write-Warning "Please resolve conflicts manually."
+        Write-Warning "Please resolve conflicts manually before sync can resume."
         return
     } else {
         Write-Host "-> Remote changes synchronized successfully." -ForegroundColor Green
@@ -111,23 +120,36 @@ function Sync-GitChanges {
     }
 
     # Step 4: Push to origin
-    Write-Host "-> Pushing to $Remote $branch..." -ForegroundColor Yellow
-    $pushOutput = git push $Remote $branch 2>&1
+    Write-Host "-> Pushing to $Remote $activeBranch..." -ForegroundColor Yellow
+    $pushOutput = git push $Remote $activeBranch 2>&1
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Changes successfully pushed to $Remote/$branch!`n" -ForegroundColor Green
+        Write-Host "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Changes successfully pushed to $Remote/$activeBranch!`n" -ForegroundColor Green
     } else {
         Write-Warning "Push failed: $pushOutput"
     }
 }
 
+$currentBranchName = Get-GitBranch
+
 Write-Host "==========================================================" -ForegroundColor Green
 Write-Host " Auto Git Sync Watcher Active" -ForegroundColor Cyan
 Write-Host " Repository : $repoRoot" -ForegroundColor White
-Write-Host " Branch     : $(Get-GitBranch)" -ForegroundColor White
+Write-Host " Branch     : $currentBranchName" -ForegroundColor White
 Write-Host " Remote     : $Remote" -ForegroundColor White
 Write-Host " Debounce   : $DebounceSeconds second(s)" -ForegroundColor White
-Write-Host " Press [Ctrl+C] to stop." -ForegroundColor Magenta
+if ($Once) {
+    Write-Host " Mode       : Single Run (-Once)" -ForegroundColor White
+} else {
+    Write-Host " Mode       : Continuous Watcher ([Ctrl+C] to stop)" -ForegroundColor White
+}
 Write-Host "==========================================================`n" -ForegroundColor Green
+
+# Initial check
+Sync-GitChanges
+
+if ($Once) {
+    exit 0
+}
 
 # Set up FileSystemWatcher
 $watcher = New-Object System.IO.FileSystemWatcher
@@ -136,7 +158,7 @@ $watcher.IncludeSubdirectories = $true
 $watcher.EnableRaisingEvents = $false
 
 # Filter out directories we don't want to trigger sync on
-$ignoredDirs = @(".git", ".dart_tool", "build", ".idea")
+$ignoredDirs = @(".git", ".dart_tool", "build", ".idea", ".vscode", "node_modules")
 
 $global:hasChanges = $false
 $global:lastChangeTime = [DateTime]::MinValue
@@ -164,9 +186,6 @@ $renamedEvent = Register-ObjectEvent $watcher "Renamed" -Action $changeAction
 $watcher.EnableRaisingEvents = $true
 
 try {
-    # Check on startup if there are already dirty changes
-    Sync-GitChanges
-
     while ($true) {
         Start-Sleep -Milliseconds 500
 
