@@ -88,7 +88,7 @@ function Sync-GitChanges {
 
     $activeBranch = Get-GitBranch
     if (-not $activeBranch) {
-        Write-Warning "Cannot determine git branch. Skippingsync."
+        Write-Warning "Cannot determine git branch. Skipping sync."
         return
     }
 
