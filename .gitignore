@@ -1,0 +1,46 @@
+# Environments and secrets
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.cert
+*.pfx
+secrets.*
+credentials.*
+id_rsa*
+
+# Operating System files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE / Editor configurations
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Node / JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+*.lock

@@ -2,23 +2,21 @@
 .SYNOPSIS
     Auto Git Sync: Watches repository files for changes, pulls remote updates first, commits and pushes changes.
 .DESCRIPTION
-    Monitors the repository directory (excluding .git, build, .dart_tool).
-    When file changes are detected:
-      1. Waits for a debounce window (default 3 seconds) to batch multiple quick edits.
-      2. Runs 'git pull --rebase' to fetch and integrate any remote changes safely without messy merge commits.
-      3. Adds all modified and untracked files ('git add -A').
-      4. Creates a commit with timestamp and changed file summaries.
-      5. Pushes the commit to the active tracking branch on origin.
-.EXAMPLE
-    .\auto_sync.ps1
-    .\auto_sync.ps1 -DebounceSeconds 5
+    Protected auto-sync script with guardrails:
+      - Checks and respects .git/index.lock from concurrent Git processes
+      - Inspects uncommitted files for accidental secrets (.env, keys)
+      - Appends [skip ci] to prevent exhausting GitHub Actions quotas
+      - Increased default debounce to 15s to prevent commit flood
+      - Supports targeting personal backup branches
 #>
 
 [CmdletBinding()]
 param(
-    [int]$DebounceSeconds = 3,
+    [int]$DebounceSeconds = 15,
     [string]$Remote = "origin",
     [string]$Branch = "",
+    [string]$CommitMessage = "",
+    [switch]$SkipCI = $true,
     [switch]$Once
 )
 
@@ -44,16 +42,70 @@ function Get-GitBranch {
     return "main"
 }
 
+function Test-GitLock {
+    $lockPath = Join-Path $repoRoot ".git\index.lock"
+    $waited = 0
+    while ((Test-Path $lockPath) -and ($waited -lt 5)) {
+        Write-Host "-> .git/index.lock is held by another process. Waiting..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+        $waited++
+    }
+    return (-not (Test-Path $lockPath))
+}
+
+function Test-SensitiveFiles {
+    param([string[]]$StatusLines)
+    $sensitivePatterns = @(
+        "^\.env(\..+)?$",
+        "(id_rsa|id_ed25519)",
+        "\.(pem|key|cert|pfx)$",
+        "(secret|credential|password).*\.(json|yaml|yml|txt|conf)$"
+    )
+
+    $blocked = @()
+    foreach ($line in $StatusLines) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed) { continue }
+        $parts = $trimmed -split '\s+', 2
+        if ($parts.Length -eq 2) {
+            $fileName = [System.IO.Path]::GetFileName($parts[1].Trim('"'))
+            foreach ($pat in $sensitivePatterns) {
+                if ($fileName -match $pat) {
+                    $blocked += $parts[1]
+                    break
+                }
+            }
+        }
+    }
+    return $blocked
+}
+
 function Sync-GitChanges {
+    if (-not (Test-GitLock)) {
+        Write-Warning "Git index is currently locked. Skipping this sync cycle."
+        return
+    }
+
     $activeBranch = Get-GitBranch
     if (-not $activeBranch) {
         Write-Warning "Cannot determine git branch. Skipping sync."
         return
     }
 
-    # Check if there are uncommitted changes or untracked files
-    $status = git status --porcelain
-    if (-not $status) {
+    # Check uncommitted status
+    $statusLines = @(git status --porcelain 2>$null)
+    if (-not $statusLines -or $statusLines.Length -eq 0 -or ($statusLines.Length -eq 1 -and [string]::IsNullOrWhiteSpace($statusLines[0]))) {
+        return
+    }
+
+    # Safeguard: prevent accidental secret leaks
+    $secretsFound = Test-SensitiveFiles -StatusLines $statusLines
+    if ($secretsFound.Count -gt 0) {
+        Write-Host "`n[Security Alert] Potentially sensitive files detected:" -ForegroundColor Red
+        foreach ($sec in $secretsFound) {
+            Write-Host "  ! $sec" -ForegroundColor Red
+        }
+        Write-Warning "Auto-sync aborted to avoid secret leakage. Please add these files to .gitignore."
         return
     }
 
@@ -61,11 +113,9 @@ function Sync-GitChanges {
     $epoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
     $stashTag = "auto-sync-$epoch"
 
-    Write-Host "`n[$timestamp] Changes detected! Starting sync..." -ForegroundColor Cyan
+    Write-Host "`n[$timestamp] Sync triggered! Checking remote updates..." -ForegroundColor Cyan
 
-    # Step 1: Check remote and pull any incoming changes safely
-    Write-Host "-> Checking remote for incoming changes (git pull --rebase $Remote $activeBranch)..." -ForegroundColor Yellow
-    
+    # Step 1: Stash & Pull Rebase
     $needsPop = $false
     git stash push -u -m "$stashTag" 2>&1 | Out-Null
     $stashList = git stash list
@@ -82,21 +132,19 @@ function Sync-GitChanges {
         }
         Write-Warning "Please resolve conflicts manually before sync can resume."
         return
-    } else {
-        Write-Host "-> Remote changes synchronized successfully." -ForegroundColor Green
     }
 
     if ($needsPop) {
         $popOutput = git stash pop 2>&1
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Stash pop encountered conflict. Please review your files."
+            Write-Warning "Stash pop encountered conflict: $popOutput"
             return
         }
     }
 
     # Re-check status after pull/pop
-    $statusAfter = git status --porcelain
-    if (-not $statusAfter) {
+    $statusAfter = @(git status --porcelain 2>$null)
+    if (-not $statusAfter -or ($statusAfter.Length -eq 1 -and [string]::IsNullOrWhiteSpace($statusAfter[0]))) {
         Write-Host "-> Working tree clean after pull. Nothing new to commit." -ForegroundColor Green
         return
     }
@@ -107,12 +155,19 @@ function Sync-GitChanges {
 
     # Step 3: Commit
     $changedSummary = (git diff --cached --name-status) -join ", "
-    if ($changedSummary.Length -gt 120) {
-        $changedSummary = $changedSummary.Substring(0, 117) + "..."
+    if ($changedSummary.Length -gt 100) {
+        $changedSummary = $changedSummary.Substring(0, 97) + "..."
     }
-    $commitMsg = "auto-sync: $timestamp - $changedSummary"
-    Write-Host "-> Committing: '$commitMsg'..." -ForegroundColor Yellow
-    git commit -m $commitMsg
+
+    $ciPrefix = if ($SkipCI) { "[skip ci] " } else { "" }
+    if ($CommitMessage) {
+        $fullCommitMsg = "$ciPrefix$CommitMessage ($timestamp)"
+    } else {
+        $fullCommitMsg = "$ciPrefix" + "auto-sync: $timestamp - $changedSummary"
+    }
+
+    Write-Host "-> Committing: '$fullCommitMsg'..." -ForegroundColor Yellow
+    git commit -m $fullCommitMsg
 
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "Commit failed. Aborting push."
@@ -132,11 +187,12 @@ function Sync-GitChanges {
 $currentBranchName = Get-GitBranch
 
 Write-Host "==========================================================" -ForegroundColor Green
-Write-Host " Auto Git Sync Watcher Active" -ForegroundColor Cyan
+Write-Host " Auto Git Sync Watcher Active (Protected Mode)" -ForegroundColor Cyan
 Write-Host " Repository : $repoRoot" -ForegroundColor White
 Write-Host " Branch     : $currentBranchName" -ForegroundColor White
 Write-Host " Remote     : $Remote" -ForegroundColor White
-Write-Host " Debounce   : $DebounceSeconds second(s)" -ForegroundColor White
+Write-Host " Debounce   : $DebounceSeconds second(s) (prevents commit spam)" -ForegroundColor White
+Write-Host " Skip CI    : $(if ($SkipCI) { 'Enabled [skip ci]' } else { 'Disabled' })" -ForegroundColor White
 if ($Once) {
     Write-Host " Mode       : Single Run (-Once)" -ForegroundColor White
 } else {
@@ -157,8 +213,8 @@ $watcher.Path = $repoRoot
 $watcher.IncludeSubdirectories = $true
 $watcher.EnableRaisingEvents = $false
 
-# Filter out directories we don't want to trigger sync on
-$ignoredDirs = @(".git", ".dart_tool", "build", ".idea", ".vscode", "node_modules")
+# Filter out directories
+$ignoredDirs = @(".git", ".dart_tool", "build", ".idea", ".vscode", "node_modules", "dist", "out")
 
 $global:hasChanges = $false
 $global:lastChangeTime = [DateTime]::MinValue
@@ -167,7 +223,6 @@ $changeAction = {
     param($sender, $eventArgs)
     $path = $eventArgs.FullPath
     
-    # Check if path is in ignored directory
     foreach ($ignored in $ignoredDirs) {
         if ($path.Contains("\$ignored\") -or $path.EndsWith("\$ignored")) {
             return
